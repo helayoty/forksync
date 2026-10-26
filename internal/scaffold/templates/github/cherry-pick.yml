@@ -1,0 +1,21 @@
+name: cherry-pick
+on:
+  issue_comment: { types: [created] }
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+# Optional: mint a short-lived GitHub App token instead of a PAT in FORK_BOT_TOKEN (either way: an identity on THIS fork, not on forksync).
+#   - uses: actions/create-github-app-token@<pinned sha>
+#     id: app
+#     with: { app-id: ${{ vars.FORKSYNC_APP_ID }}, private-key: ${{ secrets.FORKSYNC_APP_KEY }}, owner: ${{ github.repository_owner }} }
+#   then pass  token: ${{ steps.app.outputs.token }}  (requires a plain job in front of the reusable call)
+jobs:
+  pick:
+    uses: FORKSYNC_OWNER/forksync/.github/workflows/reusable-cherry-pick.yml@FORKSYNC_SHA # FORKSYNC_VERSION
+    with:
+      upstream-repo: UPSTREAM_REPO
+      forksync-version: FORKSYNC_VERSION
+      backport-style: BACKPORT_STYLE
+    secrets:
+      token: ${{ secrets.FORK_BOT_TOKEN }}

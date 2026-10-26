@@ -1,0 +1,119 @@
+version: 2
+project_name: forksync
+builds:
+  - main: ./cmd/forksync
+    env: [CGO_ENABLED=0]
+    goos: [linux, darwin, windows]
+    goarch: [amd64, arm64]
+    ldflags: ["-s -w -X main.version={{.Version}}"]
+archives:
+  - formats: [tar.gz]
+    name_template: "{{ .ProjectName }}_{{ .Os }}_{{ .Arch }}"   # matches setup/action.yml and the ADO template
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+checksum:
+  name_template: checksums.txt
+release:
+  mode: replace
+
+# SPDX SBOM per archive (goreleaser runs `syft`; forksync-release.yml installs it).
+sboms:
+  - artifacts: archive
+
+# Keyless cosign (v3) signature over checksums.txt -> checksums.txt.sigstore.json
+# (bundle: signature + Fulcio cert + Rekor entry). Verifying the checksum file
+# transitively covers every archive, deb, rpm and SBOM.
+signs:
+  - cmd: cosign
+    artifacts: checksum
+    signature: "${artifact}.sigstore.json"
+    args: ["sign-blob", "--yes", "--bundle", "${signature}", "${artifact}"]
+
+# Per-arch images; the binary from `builds` is copied into the context root.
+# IMAGE_OWNER must be lowercase (ghcr rejects upper-case repository names).
+dockers:
+  - use: buildx
+    goos: linux
+    goarch: amd64
+    dockerfile: Dockerfile
+    image_templates:
+      - "ghcr.io/{{ .Env.IMAGE_OWNER }}/forksync:{{ .Version }}-amd64"
+    build_flag_templates:
+      - --platform=linux/amd64
+      - --build-arg=VERSION={{ .Version }}
+      - --label=org.opencontainers.image.title={{ .ProjectName }}
+      - --label=org.opencontainers.image.description=Keeps a fork as upstream tag + a rebased patch stack
+      - --label=org.opencontainers.image.source={{ .GitURL }}
+      - --label=org.opencontainers.image.version={{ .Version }}
+      - --label=org.opencontainers.image.revision={{ .FullCommit }}
+      - --label=org.opencontainers.image.created={{ .Date }}
+      - --label=org.opencontainers.image.licenses=Apache-2.0
+  - use: buildx
+    goos: linux
+    goarch: arm64
+    dockerfile: Dockerfile
+    image_templates:
+      - "ghcr.io/{{ .Env.IMAGE_OWNER }}/forksync:{{ .Version }}-arm64"
+    build_flag_templates:
+      - --platform=linux/arm64
+      - --build-arg=VERSION={{ .Version }}
+      - --label=org.opencontainers.image.title={{ .ProjectName }}
+      - --label=org.opencontainers.image.description=Keeps a fork as upstream tag + a rebased patch stack
+      - --label=org.opencontainers.image.source={{ .GitURL }}
+      - --label=org.opencontainers.image.version={{ .Version }}
+      - --label=org.opencontainers.image.revision={{ .FullCommit }}
+      - --label=org.opencontainers.image.created={{ .Date }}
+      - --label=org.opencontainers.image.licenses=Apache-2.0
+
+# Multi-arch manifests. `{{ .Tag }}` (v1.2.3) is published in addition to
+# `{{ .Version }}` (1.2.3) so the same vX.Y.Z string works for release assets,
+# setup's `image:` input and the scaffolded ADO `container:` example.
+docker_manifests:
+  - name_template: "ghcr.io/{{ .Env.IMAGE_OWNER }}/forksync:{{ .Version }}"
+    image_templates: &images
+      - "ghcr.io/{{ .Env.IMAGE_OWNER }}/forksync:{{ .Version }}-amd64"
+      - "ghcr.io/{{ .Env.IMAGE_OWNER }}/forksync:{{ .Version }}-arm64"
+  - name_template: "ghcr.io/{{ .Env.IMAGE_OWNER }}/forksync:{{ .Tag }}"
+    image_templates: *images
+  - name_template: "ghcr.io/{{ .Env.IMAGE_OWNER }}/forksync:v{{ .Major }}"
+    image_templates: *images
+  - name_template: "ghcr.io/{{ .Env.IMAGE_OWNER }}/forksync:latest"
+    image_templates: *images
+
+# Keyless cosign signature on each pushed manifest (all share one digest).
+docker_signs:
+  - cmd: cosign
+    artifacts: manifests
+    args: ["sign", "--yes", "${artifact}@${digest}"]
+
+nfpms:
+  - package_name: forksync
+    file_name_template: "{{ .ConventionalFileName }}"
+    vendor: helayoty
+    homepage: "{{ .GitURL }}"
+    maintainer: "forksync maintainers <forksync@example.com>"   # TODO: real maintainer
+    description: Keeps a fork as upstream tag + a rebased patch stack.
+    license: Apache-2.0
+    formats: [deb, rpm]
+    bindir: /usr/local/bin
+    dependencies: [git]
+
+# Homebrew formula. The tap repo is OPTIONAL: create <owner>/homebrew-tap and
+# a HOMEBREW_TAP_GITHUB_TOKEN secret (contents:write on the tap) to use it,
+# or delete this whole section. GITHUB_TOKEN cannot push to another repo.
+brews:
+  - name: forksync
+    repository:
+      owner: "{{ .Env.IMAGE_OWNER }}"
+      name: homebrew-tap
+      token: '{{ envOrDefault "HOMEBREW_TAP_GITHUB_TOKEN" "" }}'
+    directory: Formula
+    homepage: "{{ .GitURL }}"
+    description: Keeps a fork as upstream tag + a rebased patch stack.
+    license: Apache-2.0
+    skip_upload: auto
+    dependencies:
+      - name: git
+    test: |
+      system "#{bin}/forksync", "version"

@@ -1,0 +1,197 @@
+name: Setup forksync
+description: >-
+  Install the forksync binary and configure git identity and the upstream
+  remote. Tries, in order: `image` (binary extracted from the OCI image,
+  cosign verified) > `version` vX.Y.Z (checksum- and cosign-verified release
+  asset) > build from the forksync source checked out at ./.forksync. A failing
+  path logs a warning and falls through to the next applicable one; the action
+  fails only when every applicable path fails.
+
+inputs:
+  version:
+    description: >-
+      forksync release tag (vX.Y.Z) to download and verify against the
+      release's checksums.txt. Empty (default) or anything else (a sha/ref)
+      builds from the forksync source already checked out at ./.forksync.
+    default: ""
+  token:
+    description: PAT/App token able to read the forksync repository (its releases and source).
+    required: true
+  upstream-repo:
+    description: owner/name of the upstream repository
+    required: true
+  repo:
+    description: forksync repository (owner/name) to download releases from
+    default: ${{ github.action_repository }}
+  image:
+    description: >-
+      forksync OCI image (e.g. ghcr.io/helayoty/forksync:v1.2.3). When set, the
+      binary is copied out of the image without running it; tried before
+      `version`, which is the fallback if anything about the image fails.
+      ghcr.io is logged into with `token` (needs read:packages / package read
+      for a private package); other registries need a prior `docker login`.
+    default: ""
+  verify:
+    description: >-
+      "true" (default): verify the image (cosign verify) or checksums.txt
+      (cosign verify-blob) against the keyless signature made by `repo`'s
+      forksync-release.yml workflow. Source builds are not affected.
+    default: "true"
+
+runs:
+  using: composite
+  steps:
+    - name: Keep .forksync out of the fork's commits
+      shell: bash
+      run: |
+        set -euo pipefail
+        EXCLUDE="$(git rev-parse --git-path info/exclude)"
+        mkdir -p "$(dirname "$EXCLUDE")"
+        grep -qxF '.forksync/' "$EXCLUDE" 2>/dev/null || echo '.forksync/' >> "$EXCLUDE"
+
+    - name: Select install methods
+      id: mode
+      shell: bash
+      env:
+        VERSION: ${{ inputs.version }}
+        IMAGE: ${{ inputs.image }}
+        VERIFY: ${{ inputs.verify }}
+      run: |
+        set -euo pipefail
+        IMG=false; REL=false; SRC=false
+        [ -n "$IMAGE" ] && IMG=true
+        [[ "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] && REL=true
+        [ -f .forksync/go.mod ] && SRC=true
+        if [ "$IMG$REL$SRC" = falsefalsefalse ]; then
+          echo "::error::nothing to install from: image is empty, version '${VERSION}' is not vX.Y.Z, and .forksync/go.mod is missing (check out the forksync repo into .forksync)"
+          exit 1
+        fi
+        NEED_COSIGN=false
+        if [ "$VERIFY" = true ] && { [ "$IMG" = true ] || [ "$REL" = true ]; } && ! command -v cosign >/dev/null 2>&1; then
+          NEED_COSIGN=true
+        fi
+        { echo "image=$IMG"; echo "release=$REL"; echo "source=$SRC"; echo "need-cosign=$NEED_COSIGN"; } >> "$GITHUB_OUTPUT"
+
+    - name: Install cosign
+      if: steps.mode.outputs.need-cosign == 'true'
+      uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+    # Each install step runs its body in a child `bash -e` so any failure is
+    # caught, reported as a warning, and the next method is tried.
+    - name: Install from image
+      id: image
+      if: steps.mode.outputs.image == 'true'
+      shell: bash
+      env:
+        TOKEN: ${{ inputs.token }}
+        IMAGE: ${{ inputs.image }}
+        REPO: ${{ inputs.repo }}
+        VERIFY: ${{ inputs.verify }}
+      run: |
+        set -uo pipefail
+        if bash -euo pipefail <<'SCRIPT'
+        # registry = first path component if it looks like a host, else Docker Hub
+        FIRST="${IMAGE%%/*}"
+        if [ "$FIRST" != "$IMAGE" ] && { [[ "$FIRST" == *.* ]] || [[ "$FIRST" == *:* ]] || [ "$FIRST" = localhost ]; }; then
+          REGISTRY="$FIRST"
+        else
+          REGISTRY="docker.io"
+        fi
+        if [ "$REGISTRY" = ghcr.io ]; then
+          echo "$TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+        fi
+        docker pull --quiet "$IMAGE"
+        # resolve to a digest once so the verified image is the one extracted
+        REF=$(docker image inspect --format '{{index .RepoDigests 0}}' "$IMAGE")
+        if [ "$VERIFY" = true ]; then
+          [ -n "$REPO" ] || { echo "input 'repo' is empty (needed to verify the signer identity)"; exit 1; }
+          cosign verify "$REF" \
+            --certificate-identity-regexp "^https://github.com/${REPO}/\.github/workflows/forksync-release\.yml@refs/(heads/main|tags/v[0-9].*)$" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com >/dev/null
+        fi
+        DIR="$RUNNER_TEMP/forksync-image"
+        rm -rf "$DIR"; mkdir -p "$DIR"
+        id=$(docker create "$REF")
+        trap 'docker rm "$id" >/dev/null' EXIT
+        docker cp "$id":/usr/local/bin/forksync "$DIR/forksync"
+        install -m 0755 "$DIR/forksync" /usr/local/bin/forksync
+        echo "installed forksync from $REF"
+        SCRIPT
+        then
+          echo "ok=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "::warning::installing forksync from image '${IMAGE}' failed; falling back to the release asset or source build"
+          echo "ok=false" >> "$GITHUB_OUTPUT"
+        fi
+
+    - name: Install from release (checksum-verified)
+      id: release
+      if: steps.image.outputs.ok != 'true' && steps.mode.outputs.release == 'true'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+        VERSION: ${{ inputs.version }}
+        REPO: ${{ inputs.repo }}
+        VERIFY: ${{ inputs.verify }}
+      run: |
+        set -uo pipefail
+        if bash -euo pipefail <<'SCRIPT'
+        [ -n "$REPO" ] || { echo "input 'repo' is empty (pass the forksync owner/name)"; exit 1; }
+        OS=$(uname -s | tr A-Z a-z); ARCH=$(uname -m); [ "$ARCH" = x86_64 ] && ARCH=amd64; [ "$ARCH" = aarch64 ] && ARCH=arm64
+        ASSET="forksync_${OS}_${ARCH}.tar.gz"
+        DIR="$RUNNER_TEMP/forksync-release"
+        rm -rf "$DIR"; mkdir -p "$DIR"
+        SIGS=(); [ "$VERIFY" = true ] && SIGS=(--pattern checksums.txt.sigstore.json)
+        gh release download "$VERSION" --repo "$REPO" --pattern "$ASSET" --pattern checksums.txt "${SIGS[@]}" --dir "$DIR"
+        cd "$DIR"
+        if [ "$VERIFY" = true ]; then
+          cosign verify-blob --bundle checksums.txt.sigstore.json \
+            --certificate-identity-regexp "^https://github.com/${REPO}/\.github/workflows/forksync-release\.yml@refs/(heads/main|tags/v[0-9].*)$" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            checksums.txt
+        fi
+        awk -v a="$ASSET" '$2 == a { f = 1 } END { exit !f }' checksums.txt || { echo "${ASSET} is not listed in checksums.txt"; exit 1; }
+        sha256sum --check --ignore-missing --strict checksums.txt
+        tar -xzf "$ASSET" forksync
+        install -m 0755 forksync /usr/local/bin/forksync
+        echo "installed forksync ${VERSION} from ${REPO} releases"
+        SCRIPT
+        then
+          echo "ok=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "::warning::installing forksync release ${VERSION} from ${REPO} failed; falling back to the source build if .forksync is checked out"
+          echo "ok=false" >> "$GITHUB_OUTPUT"
+        fi
+
+    - name: Set up Go
+      if: steps.image.outputs.ok != 'true' && steps.release.outputs.ok != 'true' && steps.mode.outputs.source == 'true'
+      uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      with:
+        go-version-file: .forksync/go.mod
+        cache: false
+
+    - name: Build from checked-out source
+      id: source
+      if: steps.image.outputs.ok != 'true' && steps.release.outputs.ok != 'true' && steps.mode.outputs.source == 'true'
+      shell: bash
+      run: |
+        set -euo pipefail
+        cd .forksync && go build -o /usr/local/bin/forksync ./cmd/forksync
+        echo "ok=true" >> "$GITHUB_OUTPUT"
+
+    - name: Check forksync was installed
+      if: steps.image.outputs.ok != 'true' && steps.release.outputs.ok != 'true' && steps.source.outputs.ok != 'true'
+      shell: bash
+      run: |
+        echo "::error::every applicable forksync install method failed (image → release → source); see the warnings above"
+        exit 1
+
+    - name: Configure git and upstream remote
+      shell: bash
+      env:
+        UPSTREAM: ${{ inputs.upstream-repo }}
+      run: |
+        git config user.name  "forksync-bot"
+        git config user.email "forksync-bot@users.noreply.github.com"
+        git remote get-url upstream >/dev/null 2>&1 || git remote add upstream "https://github.com/${UPSTREAM}.git"
+        forksync --help 2>/dev/null || true

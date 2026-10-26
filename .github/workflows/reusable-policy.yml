@@ -1,0 +1,93 @@
+name: reusable-policy
+
+# Required check on PRs into the fork's main: every new commit must be a
+# classified patch with mandatory trailers. Also posts the carry inventory.
+
+on:
+  workflow_call:
+    inputs:
+      upstream-repo:    { type: string, required: true }
+      forksync-version: { type: string, default: "" }   # vX.Y.Z = verified release asset; "" = build from this workflow's commit
+      forksync-repo:    { type: string, default: FORKSYNC_OWNER/forksync }
+      forksync-image:   { type: string, default: "" }      # override; default derives ghcr.io/<owner>/forksync:<forksync-version>
+    secrets:
+      token: { required: false }  # see reusable-sync.yml for what GITHUB_TOKEN cannot do
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ inputs.forksync-repo }}
+          ref: ${{ job.workflow_sha }}
+          path: .forksync
+          token: ${{ secrets.token || github.token }}
+          persist-credentials: false
+      - id: fsimg
+        env:
+          FS_REPO: ${{ inputs.forksync-repo }}
+          FS_VERSION: ${{ inputs.forksync-version }}
+          FS_IMAGE: ${{ inputs.forksync-image }}
+        run: |
+          IMG="$FS_IMAGE"
+          if [ -z "$IMG" ] && [[ "$FS_VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then OWNER="${FS_REPO%%/*}"; IMG="ghcr.io/${OWNER,,}/forksync:${FS_VERSION}"; fi
+          echo "image=$IMG" >> "$GITHUB_OUTPUT"
+
+      - uses: ./.forksync/setup
+        with:
+          image: ${{ steps.fsimg.outputs.image }}
+          version: ${{ inputs.forksync-version }}
+          token: ${{ secrets.token || github.token }}
+          upstream-repo: ${{ inputs.upstream-repo }}
+          repo: ${{ inputs.forksync-repo }}
+      - env:
+          BASE_REF: ${{ github.base_ref }}
+        run: forksync lint --base "origin/${BASE_REF}" --head HEAD
+
+  inventory:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ inputs.forksync-repo }}
+          ref: ${{ job.workflow_sha }}
+          path: .forksync
+          token: ${{ secrets.token || github.token }}
+          persist-credentials: false
+      - id: fsimg
+        env:
+          FS_REPO: ${{ inputs.forksync-repo }}
+          FS_VERSION: ${{ inputs.forksync-version }}
+          FS_IMAGE: ${{ inputs.forksync-image }}
+        run: |
+          IMG="$FS_IMAGE"
+          if [ -z "$IMG" ] && [[ "$FS_VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then OWNER="${FS_REPO%%/*}"; IMG="ghcr.io/${OWNER,,}/forksync:${FS_VERSION}"; fi
+          echo "image=$IMG" >> "$GITHUB_OUTPUT"
+
+      - uses: ./.forksync/setup
+        with:
+          image: ${{ steps.fsimg.outputs.image }}
+          version: ${{ inputs.forksync-version }}
+          token: ${{ secrets.token || github.token }}
+          upstream-repo: ${{ inputs.upstream-repo }}
+          repo: ${{ inputs.forksync-repo }}
+      - run: |
+          git fetch --no-tags upstream "refs/tags/$(cat UPSTREAM_BASE):refs/tags/$(cat UPSTREAM_BASE)"
+          forksync inventory --remote upstream > "$RUNNER_TEMP/inv.md"
+      - uses: marocchino/sticky-pull-request-comment@5770ad5eb8f42dd2c4f34da00c94c5381e49af88 # v3.0.5
+        with:
+          header: forksync-inventory
+          path: ${{ runner.temp }}/inv.md

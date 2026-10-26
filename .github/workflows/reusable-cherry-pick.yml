@@ -1,0 +1,134 @@
+name: reusable-cherry-pick
+
+# Urgent lane. Caller triggers on issue_comment; this workflow handles
+#   /cherry-pick 12345
+#   /cherry-pick 12345 release-1.37
+#   /cherry-pick 12345 --allow-approved
+
+on:
+  workflow_call:
+    inputs:
+      upstream-repo:    { type: string, required: true }
+      backport-style:   { type: string, default: k8s }     # k8s | prow
+      head:             { type: string, default: main }
+      forksync-version: { type: string, default: "" }      # vX.Y.Z = verified release asset; "" = build from this workflow's commit
+      forksync-repo:    { type: string, default: FORKSYNC_OWNER/forksync }
+      forksync-image:   { type: string, default: "" }      # override; default derives ghcr.io/<owner>/forksync:<forksync-version>
+    secrets:
+      token: { required: false }
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+jobs:
+  pick:
+    if: startsWith(github.event.comment.body, '/cherry-pick ')
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.token || github.token }}
+      ISSUE: ${{ github.event.issue.number }}
+      REPO: ${{ github.repository }}
+      REQUESTER: ${{ github.event.comment.user.login }}
+    steps:
+      - id: gate
+        env:
+          BODY: ${{ github.event.comment.body }}
+          ASSOCIATION: ${{ github.event.comment.author_association }}
+        run: |
+          case "$ASSOCIATION" in
+            OWNER|MEMBER|COLLABORATOR) ;;
+            *) gh issue comment "$ISSUE" --repo "$REPO" --body "Only repo members may run /cherry-pick."; exit 1 ;;
+          esac
+          set -f            # comment text is untrusted: no globbing when splitting it
+          set -- $BODY; shift
+          PR="${1:-}"
+          if ! [[ "$PR" =~ ^[0-9]+$ ]]; then
+            gh issue comment "$ISSUE" --repo "$REPO" --body "Usage: /cherry-pick <upstream PR number> [release-X.Y] [--allow-approved]"
+            exit 1
+          fi
+          echo "pr=$PR" >> "$GITHUB_OUTPUT"; shift
+          ARGS=""
+          for a in "$@"; do
+            case "$a" in
+              --allow-approved) ARGS="$ARGS --allow-approved" ;;
+              release-*)        [[ "$a" =~ ^release-[A-Za-z0-9._-]+$ ]] && ARGS="$ARGS --release-branch $a" ;;
+            esac
+          done
+          echo "args=$ARGS" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.head }}
+          fetch-depth: 0
+          # Credentials intentionally persisted: this job pushes the pick/ branch below.
+          token: ${{ secrets.token || github.token }} # zizmor: ignore[artipacked]
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ inputs.forksync-repo }}
+          ref: ${{ job.workflow_sha }}
+          path: .forksync
+          token: ${{ secrets.token || github.token }}
+          persist-credentials: false
+
+      - id: fsimg
+        env:
+          FS_REPO: ${{ inputs.forksync-repo }}
+          FS_VERSION: ${{ inputs.forksync-version }}
+          FS_IMAGE: ${{ inputs.forksync-image }}
+        run: |
+          IMG="$FS_IMAGE"
+          if [ -z "$IMG" ] && [[ "$FS_VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then OWNER="${FS_REPO%%/*}"; IMG="ghcr.io/${OWNER,,}/forksync:${FS_VERSION}"; fi
+          echo "image=$IMG" >> "$GITHUB_OUTPUT"
+
+      - id: setup
+        uses: ./.forksync/setup
+        with:
+          image: ${{ steps.fsimg.outputs.image }}
+          version: ${{ inputs.forksync-version }}
+          token: ${{ secrets.token || github.token }}
+          upstream-repo: ${{ inputs.upstream-repo }}
+          repo: ${{ inputs.forksync-repo }}
+
+      - name: Pull shared rerere cache
+        run: forksync rerere pull --remote origin
+
+      - id: pick
+        env:
+          PR: ${{ steps.gate.outputs.pr }}
+          ARGS: ${{ steps.gate.outputs.args }}
+          UPSTREAM: ${{ inputs.upstream-repo }}
+          STYLE: ${{ inputs.backport-style }}
+        run: |
+          git checkout -b "pick/${PR}"
+          set +e
+          # $ARGS is intentionally unquoted: it is a validated, space-separated flag list.
+          OUT=$(forksync cherry-pick --repo "$UPSTREAM" --remote upstream --pr "$PR" \
+                  --owner "@${REQUESTER}" --backport-style "$STYLE" \
+                  $ARGS 2>&1)
+          rc=$?; set -e
+          echo "$OUT"
+          if [ $rc -ne 0 ]; then
+            printf '/cherry-pick %s failed:\n```\n%s\n```\n' "$PR" "$OUT" > "$RUNNER_TEMP/fail.md"
+            gh issue comment "$ISSUE" --body-file "$RUNNER_TEMP/fail.md"
+            exit $rc
+          fi
+
+      - env:
+          PR: ${{ steps.gate.outputs.pr }}
+          UPSTREAM: ${{ inputs.upstream-repo }}
+          HEAD_BRANCH: ${{ inputs.head }}
+        run: |
+          git push --force-with-lease origin "HEAD:pick/${PR}"
+          printf 'Cherry-pick of %s#%s, requested by @%s in #%s.\n\nDropped automatically by the tag lane once #%s is reachable from the next synced tag.\n' \
+            "$UPSTREAM" "$PR" "$REQUESTER" "$ISSUE" "$PR" > "$RUNNER_TEMP/body.md"
+          gh label create urgent-backport --force >/dev/null 2>&1 || true
+          URL=$(gh pr create --base "$HEAD_BRANCH" --head "pick/${PR}" --label urgent-backport \
+                  --title "$(git log -1 --format=%s)" --body-file "$RUNNER_TEMP/body.md")
+          gh issue comment "$ISSUE" --body "Opened ${URL}"
+
+      - name: Push shared rerere cache
+        if: always() && steps.setup.outcome == 'success'
+        run: forksync rerere push --remote origin

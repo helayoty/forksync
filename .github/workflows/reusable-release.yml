@@ -1,0 +1,158 @@
+name: reusable-release
+
+# Release lane. Tags <UPSTREAM_BASE><sep>fork.<N>, publishes a GitHub release
+# with the patch inventory as notes, then hands off to a build:
+#   build-command set   → runs it here, pushes ghcr image if `image` is set
+#   ado-org set         → queues the Azure DevOps pipeline via REST
+#                         (pair with the ADO consumer that has `trigger: none`)
+# Both unset → tag + release only; pair with the ADO consumer that triggers
+# itself on the tag push. Never combine ado-org with the self-triggering ADO
+# consumer, or every release builds twice.
+
+on:
+  workflow_call:
+    inputs:
+      upstream-repo:    { type: string, required: true }
+      ref:              { type: string, default: main }
+      sep:              { type: string, default: "-" }     # "-" or "+"; validated by forksync next-tag
+      build-command:    { type: string, default: "" }      # e.g. make quick-release KUBE_GIT_VERSION=$VERSION
+      artifacts-glob:   { type: string, default: "_output/*" }
+      image:            { type: string, default: "" }      # e.g. ghcr.io/org/kube; empty = no image
+      ado-org:          { type: string, default: "" }
+      ado-project:      { type: string, default: "" }
+      ado-pipeline-id:  { type: string, default: "" }
+      forksync-version: { type: string, default: "" }      # vX.Y.Z = verified release asset; "" = build from this workflow's commit
+      forksync-repo:    { type: string, default: FORKSYNC_OWNER/forksync }
+      forksync-image:   { type: string, default: "" }      # override; default derives ghcr.io/<owner>/forksync:<forksync-version>
+    secrets:
+      token:   { required: false }
+      ado-pat: { required: false }
+    outputs:
+      tag:
+        value: ${{ jobs.tag.outputs.tag }}
+      image-tag:
+        value: ${{ jobs.tag.outputs.image_tag }}
+
+permissions:
+  contents: write
+  packages: write
+
+concurrency:
+  group: forksync-release
+  cancel-in-progress: false
+
+jobs:
+  tag:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.next.outputs.tag }}
+      image_tag: ${{ steps.next.outputs.image_tag }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+          # Credentials intentionally persisted: this job pushes the release tag below.
+          token: ${{ secrets.token || github.token }} # zizmor: ignore[artipacked]
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ inputs.forksync-repo }}
+          ref: ${{ job.workflow_sha }}
+          path: .forksync
+          token: ${{ secrets.token || github.token }}
+          persist-credentials: false
+      - id: fsimg
+        env:
+          FS_REPO: ${{ inputs.forksync-repo }}
+          FS_VERSION: ${{ inputs.forksync-version }}
+          FS_IMAGE: ${{ inputs.forksync-image }}
+        run: |
+          IMG="$FS_IMAGE"
+          if [ -z "$IMG" ] && [[ "$FS_VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then OWNER="${FS_REPO%%/*}"; IMG="ghcr.io/${OWNER,,}/forksync:${FS_VERSION}"; fi
+          echo "image=$IMG" >> "$GITHUB_OUTPUT"
+
+      - uses: ./.forksync/setup
+        with:
+          image: ${{ steps.fsimg.outputs.image }}
+          version: ${{ inputs.forksync-version }}
+          token: ${{ secrets.token || github.token }}
+          upstream-repo: ${{ inputs.upstream-repo }}
+          repo: ${{ inputs.forksync-repo }}
+      - run: |
+          git fetch --no-tags upstream "refs/tags/$(cat UPSTREAM_BASE):refs/tags/$(cat UPSTREAM_BASE)"
+          forksync lint --base "$(cat UPSTREAM_BASE)" --head HEAD
+      - id: next
+        env:
+          SEP: ${{ inputs.sep }}
+        run: forksync next-tag --remote origin --sep "$SEP" >> "$GITHUB_OUTPUT"
+      - env:
+          GH_TOKEN: ${{ secrets.token || github.token }}
+          TAG: ${{ steps.next.outputs.tag }}
+        run: |
+          { echo "Upstream base: \`$(cat UPSTREAM_BASE)\`"; echo; forksync inventory --remote upstream; } > "$RUNNER_TEMP/notes.md"
+          git tag -a "$TAG" -F "$RUNNER_TEMP/notes.md"
+          git push origin "refs/tags/$TAG"
+          gh release create "$TAG" --title "$TAG" --notes-file "$RUNNER_TEMP/notes.md"
+
+  build:
+    needs: tag
+    if: inputs.build-command != ''
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ needs.tag.outputs.tag }}
+      IMAGE_TAG: ${{ needs.tag.outputs.image_tag }}
+      IMAGE: ${{ inputs.image }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/tags/${{ needs.tag.outputs.tag }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+      - env:
+          BUILD_COMMAND: ${{ inputs.build-command }}
+        run: eval "$BUILD_COMMAND"   # caller-supplied command; $VERSION / $IMAGE_TAG are in env
+      - if: inputs.image != ''
+        id: registry
+        run: echo "host=${IMAGE%%/*}" >> "$GITHUB_OUTPUT"
+      - if: inputs.image != ''
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ${{ steps.registry.outputs.host }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.token || github.token }}
+      - if: inputs.image != ''
+        run: |
+          docker build --build-arg VERSION="$VERSION" -t "${IMAGE}:${IMAGE_TAG}" .
+          docker push "${IMAGE}:${IMAGE_TAG}"
+      - env:
+          GH_TOKEN: ${{ secrets.token || github.token }}
+          ARTIFACTS_GLOB: ${{ inputs.artifacts-glob }}
+        run: |
+          # $ARTIFACTS_GLOB is intentionally unquoted so the shell expands the glob.
+          shopt -s nullglob; files=($ARTIFACTS_GLOB)
+          [ ${#files[@]} -eq 0 ] || gh release upload "$VERSION" "${files[@]}" --clobber --repo "$GITHUB_REPOSITORY"
+
+  ado:
+    needs: tag
+    if: inputs.ado-org != ''
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          ADO_PAT: ${{ secrets.ado-pat }}
+          ADO_ORG: ${{ inputs.ado-org }}
+          ADO_PROJECT: ${{ inputs.ado-project }}
+          ADO_PIPELINE_ID: ${{ inputs.ado-pipeline-id }}
+          TAG: ${{ needs.tag.outputs.tag }}
+          IMAGE_TAG: ${{ needs.tag.outputs.image_tag }}
+        run: |
+          set -euo pipefail
+          [ -n "$ADO_PAT" ] || { echo "::error::ado-org is set but the ado-pat secret is empty"; exit 1; }
+          jq -n --arg ref "refs/tags/${TAG}" --arg img "$IMAGE_TAG" \
+            '{resources: {repositories: {self: {refName: $ref}}}, templateParameters: {imageTag: $img}}' |
+          curl -sSf -u ":${ADO_PAT}" -H "Content-Type: application/json" \
+            "https://dev.azure.com/${ADO_ORG}/${ADO_PROJECT}/_apis/pipelines/${ADO_PIPELINE_ID}/runs?api-version=7.1" \
+            -d @-

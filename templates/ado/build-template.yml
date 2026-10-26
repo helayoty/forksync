@@ -1,0 +1,91 @@
+# Azure DevOps steps template. Consumers reference it via a repository
+# resource (see internal/scaffold/templates/ado/consumer-trigger.yml and
+# consumer-queue.yml) and supply their own build steps; this template only
+# derives the version from the tag and gates on patch policy.
+
+parameters:
+  - name: upstreamRepo        # owner/name
+    type: string
+  - name: forksyncVersion     # release tag vX.Y.Z (scaffolded consumers pin it); "latest" kept for old consumers
+    type: string
+    default: latest
+  - name: forksyncRepo        # owner/name of the forksync repo on GitHub
+    type: string
+    default: FORKSYNC_OWNER/forksync
+  - name: imageTag            # set by reusable-release via REST; derived from tag otherwise
+    type: string
+    default: ""
+  - name: buildSteps          # the project's real build/push steps; see consumer file
+    type: stepList
+    default: []
+
+steps:
+  - checkout: self
+    fetchDepth: 0
+    fetchTags: true
+
+  - bash: |
+      set -euo pipefail
+      case "$BUILD_SOURCEBRANCH" in
+        refs/tags/*) TAG="${BUILD_SOURCEBRANCH#refs/tags/}" ;;
+        *) echo "##vso[task.logissue type=error]release builds run only from a tag"; exit 1 ;;
+      esac
+      BASE=$(cat UPSTREAM_BASE)
+      case "$TAG" in
+        "$BASE"*fork.*) ;;
+        *) echo "##vso[task.logissue type=error]tag $TAG does not match UPSTREAM_BASE $BASE"; exit 1 ;;
+      esac
+      IMAGE_TAG="$IMAGE_TAG_PARAM"; [ -n "$IMAGE_TAG" ] || IMAGE_TAG="${TAG//+/-}"
+      echo "##vso[task.setvariable variable=VERSION]$TAG"
+      echo "##vso[task.setvariable variable=IMAGE_TAG]$IMAGE_TAG"
+      echo "##vso[task.setvariable variable=UPSTREAM_BASE]$BASE"
+      echo "##vso[build.updatebuildnumber]$TAG"
+    displayName: forksync · derive version from tag
+    env:
+      IMAGE_TAG_PARAM: ${{ parameters.imageTag }}
+
+  - bash: |
+      set -euo pipefail
+      # Already on PATH when the job runs in the forksync container (consumer `container:`).
+      if command -v forksync >/dev/null 2>&1; then
+        echo "using preinstalled $(command -v forksync) ($(forksync version 2>/dev/null || echo unknown))"
+      else
+        OS=$(uname -s | tr A-Z a-z); ARCH=$(uname -m); [ "$ARCH" = x86_64 ] && ARCH=amd64; [ "$ARCH" = aarch64 ] && ARCH=arm64
+        ASSET="forksync_${OS}_${ARCH}.tar.gz"
+        BASE_URL="https://github.com/${FORKSYNC_REPO}/releases/latest/download"
+        [ "$FS_VERSION" = latest ] || BASE_URL="https://github.com/${FORKSYNC_REPO}/releases/download/${FS_VERSION}"
+        DIR="$(Agent.TempDirectory)/forksync"; rm -rf "$DIR"; mkdir -p "$DIR"; cd "$DIR"
+        if [ -n "${GH_TOKEN:-}" ]; then
+          # private forksync repo: release assets are only reachable through the API
+          TAGARG=""; [ "$FS_VERSION" = latest ] || TAGARG="$FS_VERSION"
+          gh release download $TAGARG --repo "$FORKSYNC_REPO" --pattern "$ASSET" --pattern checksums.txt \
+            --pattern checksums.txt.sigstore.json --dir .
+        else
+          curl -sSfL -o "$ASSET" "$BASE_URL/$ASSET"
+          curl -sSfL -o checksums.txt "$BASE_URL/checksums.txt"
+          curl -sSfL -o checksums.txt.sigstore.json "$BASE_URL/checksums.txt.sigstore.json"
+        fi
+        if command -v cosign >/dev/null 2>&1; then
+          cosign verify-blob --bundle checksums.txt.sigstore.json \
+            --certificate-identity-regexp "^https://github.com/${FORKSYNC_REPO}/\.github/workflows/forksync-release\.yml@refs/(heads/main|tags/v[0-9].*)$" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            checksums.txt
+        else
+          echo "##vso[task.logissue type=warning]cosign not on PATH; checksums.txt signature not verified (sha256 still checked)"
+        fi
+        awk -v a="$ASSET" '$2 == a { f = 1 } END { exit !f }' checksums.txt || { echo "##vso[task.logissue type=error]$ASSET not listed in checksums.txt"; exit 1; }
+        sha256sum --check --ignore-missing --strict checksums.txt
+        tar -xzf "$ASSET" forksync && install -m 0755 forksync /usr/local/bin/forksync
+      fi
+      cd "$(Build.SourcesDirectory)"
+      git remote add upstream "https://github.com/${UPSTREAM}.git"
+      git fetch --no-tags upstream "refs/tags/${UPSTREAM_BASE}:refs/tags/${UPSTREAM_BASE}"
+      forksync lint --base "$UPSTREAM_BASE" --head HEAD
+    displayName: forksync · patch policy gate
+    env:
+      FS_VERSION: ${{ parameters.forksyncVersion }}
+      FORKSYNC_REPO: ${{ parameters.forksyncRepo }}
+      UPSTREAM: ${{ parameters.upstreamRepo }}
+      GH_TOKEN: $(GH_TOKEN)         # optional pipeline variable; only needed if a private forksync fork is used
+
+  - ${{ parameters.buildSteps }}

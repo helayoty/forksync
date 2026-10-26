@@ -1,0 +1,34 @@
+name: release
+# Tag + GitHub release, then queue the Azure DevOps pipeline over REST.
+# Pair with the ADO consumer that has `trigger: none` (otherwise the tag push
+# triggers a second build). Set repo vars ADO_ORG / ADO_PROJECT /
+# ADO_PIPELINE_ID and the secret ADO_PAT (Build: Read & execute).
+on:
+  workflow_dispatch:
+    inputs:
+      sep:
+        description: 'Downstream version form: "-" → v1.38.0-fork.N (semver pre-release), "+" → v1.38.0+fork.N (build metadata)'
+        type: choice
+        options: ["-", "+"]
+        default: "-"
+permissions:
+  contents: write
+  packages: write
+# Optional: mint a short-lived GitHub App token instead of a PAT in FORK_BOT_TOKEN (either way: an identity on THIS fork, not on forksync).
+#   - uses: actions/create-github-app-token@<pinned sha>
+#     id: app
+#     with: { app-id: ${{ vars.FORKSYNC_APP_ID }}, private-key: ${{ secrets.FORKSYNC_APP_KEY }}, owner: ${{ github.repository_owner }} }
+#   then pass  token: ${{ steps.app.outputs.token }}  (requires a plain job in front of the reusable call)
+jobs:
+  release:
+    uses: FORKSYNC_OWNER/forksync/.github/workflows/reusable-release.yml@FORKSYNC_SHA # FORKSYNC_VERSION
+    with:
+      upstream-repo: UPSTREAM_REPO
+      forksync-version: FORKSYNC_VERSION
+      sep: ${{ inputs.sep }}
+      ado-org: ${{ vars.ADO_ORG }}
+      ado-project: ${{ vars.ADO_PROJECT }}
+      ado-pipeline-id: ${{ vars.ADO_PIPELINE_ID }}
+    secrets:
+      token: ${{ secrets.FORK_BOT_TOKEN }}
+      ado-pat: ${{ secrets.ADO_PAT }}

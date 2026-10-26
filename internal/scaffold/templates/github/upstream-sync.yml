@@ -1,0 +1,24 @@
+name: upstream-sync
+on:
+  schedule: [{ cron: "17 6 * * *" }]
+  workflow_dispatch:
+    inputs:
+      ref: { description: "Upstream tag or sha (default: latest final tag)", required: false }
+permissions:
+  contents: write
+  pull-requests: write
+# Optional: mint a short-lived GitHub App token instead of a PAT in FORK_BOT_TOKEN (either way: an identity on THIS fork, not on forksync).
+#   - uses: actions/create-github-app-token@<pinned sha>
+#     id: app
+#     with: { app-id: ${{ vars.FORKSYNC_APP_ID }}, private-key: ${{ secrets.FORKSYNC_APP_KEY }}, owner: ${{ github.repository_owner }} }
+#   then pass  token: ${{ steps.app.outputs.token }}  (requires a plain job in front of the reusable call)
+jobs:
+  sync:
+    uses: FORKSYNC_OWNER/forksync/.github/workflows/reusable-sync.yml@FORKSYNC_SHA # FORKSYNC_VERSION
+    with:
+      upstream-repo: UPSTREAM_REPO
+      forksync-version: FORKSYNC_VERSION
+      ref: ${{ inputs.ref || '' }}
+      tag-glob: TAG_GLOB
+    secrets:
+      token: ${{ secrets.FORK_BOT_TOKEN }}

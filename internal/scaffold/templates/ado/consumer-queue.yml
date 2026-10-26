@@ -1,0 +1,51 @@
+# Drop this in the fork as azure-pipelines.yml (forksync init does it).
+# Requires a GitHub service connection named "github" in the ADO project.
+# Variant: never triggers itself; the GitHub release workflow
+# (release-ado-queue.yml) queues it over REST with the release tag and
+# imageTag, so each release builds exactly once.
+
+trigger: none
+pr: none
+
+parameters:
+  - name: imageTag
+    type: string
+    default: ""
+
+resources:
+  repositories:
+    - repository: forksync
+      type: github
+      name: FORKSYNC_OWNER/forksync
+      ref: refs/tags/FORKSYNC_VERSION
+      endpoint: github
+
+pool:
+  vmImage: ubuntu-latest
+
+# Optional: run the job in the forksync image instead of downloading the binary.
+# Needs a Docker registry service connection named "ghcr"; the template then skips its download step.
+# container: { image: ghcr.io/FORKSYNC_OWNER/forksync:FORKSYNC_VERSION, endpoint: ghcr }
+
+steps:
+  - template: templates/ado/build-template.yml@forksync
+    parameters:
+      upstreamRepo: UPSTREAM_REPO
+      forksyncVersion: FORKSYNC_VERSION
+      imageTag: ${{ parameters.imageTag }}
+      buildSteps:
+        - task: GoTool@0
+          inputs: { version: "1.24" }
+        # Replace with the project's real targets, e.g.
+        #   k/k:   make quick-release KUBE_GIT_VERSION=$(VERSION)
+        #   kueue: make image-build image-push GIT_TAG=$(VERSION) IMAGE_REGISTRY=$(containerRegistry)
+        - bash: make build VERSION=$(VERSION)
+          displayName: Build
+        - task: Docker@2
+          inputs:
+            command: buildAndPush
+            repository: $(containerRegistry)/$(imageName)
+            dockerfile: Dockerfile
+            tags: $(IMAGE_TAG)
+        - publish: $(Build.SourcesDirectory)/_output
+          artifact: binaries
