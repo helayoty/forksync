@@ -98,22 +98,3 @@ nfpms:
     formats: [deb, rpm]
     bindir: /usr/local/bin
     dependencies: [git]
-
-# Homebrew formula. The tap repo is OPTIONAL: create <owner>/homebrew-tap and
-# a HOMEBREW_TAP_GITHUB_TOKEN secret (contents:write on the tap) to use it,
-# or delete this whole section. GITHUB_TOKEN cannot push to another repo.
-brews:
-  - name: forksync
-    repository:
-      owner: "{{ .Env.IMAGE_OWNER }}"
-      name: homebrew-tap
-      token: '{{ envOrDefault "HOMEBREW_TAP_GITHUB_TOKEN" "" }}'
-    directory: Formula
-    homepage: "{{ .GitURL }}"
-    description: Keeps a fork as upstream tag + a rebased patch stack.
-    license: Apache-2.0
-    skip_upload: auto
-    dependencies:
-      - name: git
-    test: |
-      system "#{bin}/forksync", "version"

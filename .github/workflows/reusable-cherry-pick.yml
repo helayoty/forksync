@@ -12,7 +12,7 @@ on:
       backport-style:   { type: string, default: k8s }     # k8s | prow
       head:             { type: string, default: main }
       forksync-version: { type: string, default: "" }      # vX.Y.Z = verified release asset; "" = build from this workflow's commit
-      forksync-repo:    { type: string, default: FORKSYNC_OWNER/forksync }
+      forksync-repo:    { type: string, required: true }   # owner/name of the forksync repo (init fills it)
       forksync-image:   { type: string, default: "" }      # override; default derives ghcr.io/<owner>/forksync:<forksync-version>
     secrets:
       token: { required: false }

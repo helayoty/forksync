@@ -31,6 +31,7 @@ steps:
   - template: templates/ado/build-template.yml@forksync
     parameters:
       upstreamRepo: UPSTREAM_REPO
+      forksyncRepo: FORKSYNC_OWNER/forksync
       forksyncVersion: FORKSYNC_VERSION
       imageTag: ${{ parameters.imageTag }}
       buildSteps:

@@ -24,6 +24,7 @@ jobs:
     uses: FORKSYNC_OWNER/forksync/.github/workflows/reusable-release.yml@FORKSYNC_SHA # FORKSYNC_VERSION
     with:
       upstream-repo: UPSTREAM_REPO
+      forksync-repo: FORKSYNC_OWNER/forksync
       forksync-version: FORKSYNC_VERSION
       sep: ${{ inputs.sep }}
       ado-org: ${{ vars.ADO_ORG }}

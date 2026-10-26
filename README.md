@@ -10,7 +10,7 @@ a bot re-applies the stack onto the new tag, drops patches upstream has absorbed
 ## Quick start
 
 ```sh
-go install github.com/helayoty/forksync/cmd/forksync@latest     # or brew / deb / rpm / image, see Install
+go install github.com/helayoty/forksync/cmd/forksync@latest     # or deb / rpm / image, see Install
 
 git clone git@github.com:acme/kubernetes && cd kubernetes
 git remote add upstream https://github.com/kubernetes/kubernetes && git fetch --tags upstream
@@ -92,7 +92,6 @@ Both templates leave the actual `make` targets to you.
 | GitHub Actions | nothing — the reusable workflows install `ghcr.io/helayoty/forksync:<forksync-version>` (cosign-verified), falling back to the signed release asset, then to a source build |
 | Azure DevOps | `container: ghcr.io/helayoty/forksync:vX.Y.Z` on the job, or let `build-template.yml` download the asset |
 | Any container CI | `ghcr.io/helayoty/forksync:vX.Y.Z` (Debian, `git` + `gh`, no entrypoint) with `command: [forksync, …]` |
-| Laptop | `brew install helayoty/tap/forksync` · `go install …/cmd/forksync@vX.Y.Z` · `.deb` / `.rpm` from the release · `docker run --rm -v "$PWD:/work" -w /work ghcr.io/helayoty/forksync:vX.Y.Z forksync …` |
 
 Verify a download (keyless cosign; the identity is this repo's `forksync-release.yml` workflow):
 
@@ -123,9 +122,8 @@ forksync version
 their own `release.yml` calls `reusable-release.yml`.
 
 - **Release**: Actions → *forksync-release* → *Run workflow* → pick `patch` / `minor` / `major` (or type a version). The run
-  tests, binds the templates to this repo's owner (first release only), tags `vX.Y.Z`, then publishes: multi-arch
-  image, archives, deb/rpm, SBOMs, cosign signatures, SLSA attestations, Homebrew (if a tap repo and
-  `HOMEBREW_TAP_GITHUB_TOKEN` exist). The release notes end with the exact `init` flags consumers should pin.
+  tests, tags `vX.Y.Z`, then publishes: multi-arch
+  image, archives, deb/rpm, SBOMs, cosign signatures, SLSA attestations. The release notes end with the exact `init` flags consumers should pin.
 - After the **first** release, make the ghcr package public (packages default to private).
 - `go test ./...` builds real git fixtures: every drop signal, patch-release backports, conflict skipping, rerere
   train → push → pull, `init` in all ADO modes. `make image` builds a local snapshot without publishing.

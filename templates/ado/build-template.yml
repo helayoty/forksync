@@ -9,9 +9,8 @@ parameters:
   - name: forksyncVersion     # release tag vX.Y.Z (scaffolded consumers pin it); "latest" kept for old consumers
     type: string
     default: latest
-  - name: forksyncRepo        # owner/name of the forksync repo on GitHub
+  - name: forksyncRepo        # owner/name of the forksync repo on GitHub (consumer passes it)
     type: string
-    default: FORKSYNC_OWNER/forksync
   - name: imageTag            # set by reusable-release via REST; derived from tag otherwise
     type: string
     default: ""

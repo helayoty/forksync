@@ -15,7 +15,7 @@ on:
       head:            { type: string, default: main }
       sync-owner:      { type: string, default: "@forksync-bot" }
       forksync-version: { type: string, default: "" }         # vX.Y.Z = verified release asset; "" = build from this workflow's commit
-      forksync-repo:   { type: string, default: FORKSYNC_OWNER/forksync }
+      forksync-repo:    { type: string, required: true }   # owner/name of the forksync repo (init fills it)
       forksync-image:   { type: string, default: "" }      # override; default derives ghcr.io/<owner>/forksync:<forksync-version>
     secrets:
       token:
