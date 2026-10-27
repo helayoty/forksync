@@ -234,17 +234,114 @@ func TestSync_ConflictIsReportedAndSkipped(t *testing.T) {
 func TestHumanCommits(t *testing.T) {
 	f := newFixture(t)
 	f.git(f.fork, "checkout", "-qb", "sync/x", "v1.38.0")
-	t.Setenv("GIT_AUTHOR_NAME", BotName)
-	f.commit(f.fork, "UPSTREAM: <carry>: bot")
+	// the bot cherry-picked a patch alice wrote: author alice, committer bot
+	t.Setenv("GIT_AUTHOR_NAME", "alice")
+	t.Setenv("GIT_COMMITTER_NAME", BotName)
+	f.commit(f.fork, "UPSTREAM: <carry>: picked by the bot")
 	shas, err := HumanCommits(f.ctx, f.fork, "v1.38.0", "sync/x")
 	if err != nil || len(shas) != 0 {
 		t.Fatalf("bot-only: %v %v", shas, err)
 	}
-	t.Setenv("GIT_AUTHOR_NAME", "alice")
+	t.Setenv("GIT_COMMITTER_NAME", "alice")
 	f.commit(f.fork, "UPSTREAM: <carry>: human fix")
 	shas, err = HumanCommits(f.ctx, f.fork, "v1.38.0", "sync/x")
 	if err != nil || len(shas) != 1 {
 		t.Fatalf("with human: %v %v", shas, err)
+	}
+}
+
+func as(t *testing.T, name string) {
+	t.Helper()
+	t.Setenv("GIT_AUTHOR_NAME", name)
+	t.Setenv("GIT_COMMITTER_NAME", name)
+}
+
+func subjects(ps []patch.Patch) []string {
+	var s []string
+	for _, p := range ps {
+		if !p.IsBaseBump {
+			s = append(s, p.Subject)
+		}
+	}
+	return s
+}
+
+// land merges a sync branch the way GitHub's "Create a merge commit" does.
+func (f *fixture) land(branch string) {
+	f.t.Helper()
+	f.git(f.fork, "checkout", "-q", "main")
+	f.git(f.fork, "merge", "-q", "--no-ff", "-m", "Merge pull request #1 from o/"+branch, branch)
+	if d := f.git(f.fork, "diff", "--name-only", "main", branch); d != "" {
+		f.t.Fatalf("landed tree differs from %s: %s", branch, d)
+	}
+}
+
+func TestSync_LandAndResync(t *testing.T) {
+	f := newFixture(t)
+	as(t, "alice")
+	f.write(f.fork, "mine.go", "mine\n")
+	f.commit(f.fork, "UPSTREAM: <carry>: downstream feature\n\nDownstream-Owner: @alice\nUpstream: none: ours")
+	f.write(f.fork, "api.go", "x\nfix100\n")
+	f.commit(f.fork, "UPSTREAM: 100: fix api\n\n(cherry picked from commit "+f.shas["pr100"]+")\nDownstream-Owner: @alice")
+	oldMain := f.git(f.fork, "rev-parse", "main")
+
+	as(t, BotName)
+	res, err := f.sync("v1.38.0")
+	if err != nil {
+		t.Fatalf("sync: %v", err)
+	}
+	if got := subjects(res.Kept); strings.Join(got, "|") != "UPSTREAM: <carry>: downstream feature" {
+		t.Fatalf("kept = %v", got)
+	}
+	if !strings.Contains(res.RangeDiff, "downstream feature") {
+		t.Fatalf("range-diff misses the carried patch:\n%s", res.RangeDiff)
+	}
+	// A branch the bot built has no human commits, so the next run may refresh it.
+	if h, err := HumanCommits(f.ctx, f.fork, "v1.38.0", "sync/v1.38.0"); err != nil || len(h) != 0 {
+		t.Fatalf("bot-built branch reported human commits: %v %v", h, err)
+	}
+	// The PR range lints clean: the stack and base bump, no upstream commits.
+	_, pr, err := StackOf(f.ctx, f.fork, "upstream", "sync/v1.38.0", oldMain)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pr) != 2 || strings.Join(subjects(pr), "|") != "UPSTREAM: <carry>: downstream feature" {
+		t.Fatalf("PR range = %v", pr)
+	}
+	for _, p := range pr {
+		if errs := patch.Lint(p); len(errs) > 0 {
+			t.Fatalf("lint %q: %v", p.Subject, errs)
+		}
+	}
+
+	as(t, "alice")
+	f.land("sync/v1.38.0")
+	base, stack, err := StackOf(f.ctx, f.fork, "upstream", "main")
+	if err != nil || base != "v1.38.0" {
+		t.Fatalf("base = %q, err = %v", base, err)
+	}
+	if got := subjects(stack); strings.Join(got, "|") != "UPSTREAM: <carry>: downstream feature" {
+		t.Fatalf("stack after landing = %v", got)
+	}
+
+	// A patch merged after landing joins the stack; the next sync carries each patch once.
+	f.write(f.fork, "late.go", "late\n")
+	f.commit(f.fork, "UPSTREAM: <carry>: late patch\n\nDownstream-Owner: @bob\nUpstream: none: ours")
+	as(t, BotName)
+	res, err = f.sync("v1.38.1")
+	if err != nil {
+		t.Fatalf("second sync: %v", err)
+	}
+	want := "UPSTREAM: <carry>: downstream feature|UPSTREAM: <carry>: late patch"
+	if got := subjects(res.Kept); strings.Join(got, "|") != want || len(res.Dropped) != 0 {
+		t.Fatalf("second sync kept = %v dropped = %v", got, names(res.Dropped))
+	}
+
+	as(t, "alice")
+	f.land("sync/v1.38.1")
+	base, stack, err = StackOf(f.ctx, f.fork, "upstream", "main")
+	if err != nil || base != "v1.38.1" || strings.Join(subjects(stack), "|") != want {
+		t.Fatalf("after second landing: base %q stack %v err %v", base, subjects(stack), err)
 	}
 }
 

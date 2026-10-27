@@ -18,6 +18,7 @@ import (
 
 	"github.com/helayoty/forksync/internal/gitx"
 	"github.com/helayoty/forksync/internal/patch"
+	fsync "github.com/helayoty/forksync/internal/sync"
 )
 
 const DefaultBranch = "forksync/rerere"
@@ -128,16 +129,17 @@ type Trained struct {
 
 // Train learns resolutions for patches an owner re-applied by hand on branch.
 //
-// For every non-bot commit c on base..branch whose subject matches a patch p
-// in stack, it replays p onto c's parent in a scratch worktree; if that
-// conflicts, the conflicted files are replaced with c's versions and
-// `git rerere` records the resolution. Nothing on branch is modified.
+// For every first-parent commit c on base..branch that the bot did not commit
+// and whose subject matches a patch p in stack, it replays p onto c's parent
+// in a scratch worktree; if that conflicts, the conflicted files are replaced
+// with c's versions and `git rerere` records the resolution. Nothing on
+// branch is modified.
 func Train(ctx context.Context, g gitx.Runner, stack []patch.Patch, base, branch string) ([]Trained, error) {
 	bySubject := map[string]patch.Patch{}
 	for _, p := range stack {
 		bySubject[p.Subject] = p
 	}
-	out, err := g.Git(ctx, "log", "--reverse", "--format=%H%x00%an%x00%s", base+".."+branch)
+	out, err := g.Git(ctx, "log", "--reverse", "--first-parent", "--format=%H%x00%cn%x00%s", base+".."+branch)
 	if err != nil {
 		return nil, err
 	}
@@ -158,7 +160,7 @@ func Train(ctx context.Context, g gitx.Runner, stack []patch.Patch, base, branch
 	var learned []Trained
 	for _, rec := range strings.Split(out, "\n") {
 		parts := strings.SplitN(rec, "\x00", 3)
-		if len(parts) != 3 || parts[1] == "forksync-bot" {
+		if len(parts) != 3 || parts[1] == fsync.BotName {
 			continue
 		}
 		c, subject := parts[0], parts[2]

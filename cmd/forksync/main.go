@@ -103,12 +103,14 @@ func cmdLint(ctx context.Context, g gitx.Runner, args []string) error {
 	fs := flag.NewFlagSet("lint", flag.ExitOnError)
 	base := fs.String("base", "origin/main", "merge base to lint from")
 	head := fs.String("head", "HEAD", "tip to lint")
+	remote := fs.String("remote", "upstream", "upstream remote, used to fetch the head's UPSTREAM_BASE tag if missing")
 	fs.Parse(args)
 	mb, err := g.Git(ctx, "merge-base", *base, *head)
 	if err != nil {
 		return err
 	}
-	ps, err := patch.List(ctx, g, mb, *head)
+	// Upstream commits a sync PR brings in are excluded via the head's UPSTREAM_BASE.
+	_, ps, err := fsync.StackOf(ctx, g, *remote, *head, mb)
 	if err != nil {
 		return err
 	}
@@ -153,15 +155,7 @@ func cmdInventory(ctx context.Context, g gitx.Runner, args []string) error {
 	remote := fs.String("remote", "upstream", "upstream remote name")
 	head := fs.String("head", "HEAD", "tip")
 	fs.Parse(args)
-	base, err := fsync.ReadBase(g.Dir)
-	if err != nil {
-		return err
-	}
-	ref := *remote + "/" + base
-	if _, err := g.Git(ctx, "rev-parse", "--verify", "--quiet", ref+"^{commit}"); err != nil {
-		ref = base
-	}
-	ps, err := patch.List(ctx, g, ref, *head)
+	base, ps, err := fsync.StackOf(ctx, g, *remote, *head)
 	if err != nil {
 		return err
 	}
@@ -284,20 +278,20 @@ func cmdRerere(ctx context.Context, g gitx.Runner, args []string) error {
 		if *syncBranch == "" {
 			return errors.New("--sync-branch is required")
 		}
-		base, err := fsync.ReadBase(g.Dir)
-		if err != nil {
-			return err
-		}
-		stack, err := patch.List(ctx, g, fsync.ResolveRef(ctx, g, *upstream, base), *head)
+		_, stack, err := fsync.StackOf(ctx, g, *upstream, *head)
 		if err != nil {
 			return err
 		}
 		// the sync branch's base is its UPSTREAM_BASE, not main's
-		newBase, err := g.Git(ctx, "show", *syncBranch+":"+fsync.BaseFile)
+		newBase, err := fsync.BaseOf(ctx, g, *syncBranch)
 		if err != nil {
 			return err
 		}
-		learned, err := rerere.Train(ctx, g, stack, fsync.ResolveRef(ctx, g, *upstream, strings.TrimSpace(newBase)), *syncBranch)
+		newRef, err := fsync.EnsureRef(ctx, g, *upstream, newBase)
+		if err != nil {
+			return err
+		}
+		learned, err := rerere.Train(ctx, g, stack, newRef, *syncBranch)
 		for _, l := range learned {
 			fmt.Printf("learned %s from %s (%s)\n", l.Patch.Subject, l.From[:12], strings.Join(l.Files, ", "))
 		}

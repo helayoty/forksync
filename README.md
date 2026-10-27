@@ -24,7 +24,9 @@ git push -u origin main
 `init` writes `UPSTREAM_BASE` and four small workflows that call forksync's reusable ones, pinned to a commit.
 Then, in the fork's settings:
 
-- Branch protection on `main`: require `patch-policy / policy / lint`; squash or rebase merges only.
+- Branch protection on `main`: require `patch-policy / policy / lint`; allow merge commits and do not require linear
+  history (see [Landing a sync PR](#landing-a-sync-pr)). For your own PRs, prefer squash with the PR title and
+  description as the commit message, so the trailers survive.
 - Optional secret `FORK_BOT_TOKEN`: a GitHub App or PAT identity **on the fork** (`contents`, `pull-requests`,
   `issues` write). Without it everything runs on `GITHUB_TOKEN`, whose PRs never trigger checks — so the bot's
   sync and cherry-pick PRs would arrive without `patch-policy` or CI. Nothing is needed on forksync itself.
@@ -63,8 +65,18 @@ The bot never asks you to resolve on its schedule:
 
 1. Conflicting patches are **skipped**, the rest land, and the PR opens as a draft naming each skipped patch and its owner.
 2. The owner runs `git cherry-pick <sha>` on `sync/<tag>`, resolves, pushes. No local setup.
-3. The next bot run sees human commits, leaves the branch alone, learns the resolution (`git rerere`, stored in the
-   fork's `forksync/rerere` branch) and reuses it on every later sync.
+3. The next bot run sees commits it did not make, leaves the branch alone, learns the resolution (`git rerere`, stored
+   in the fork's `forksync/rerere` branch) and reuses it on every later sync. Delete the branch to let the bot rebuild it.
+
+### Landing a sync PR
+
+A sync branch is the new upstream tag, the re-applied stack, the `UPSTREAM_BASE` bump, and finally a merge of the old
+`main` that keeps the branch's tree and records `Forksync-Supersedes: <old main sha>`. The PR therefore contains its
+base, merges without conflicts, and shows the net upgrade diff.
+
+Land it with **Create a merge commit**. Squash or rebase would drop the upstream history the branch brings in.
+`sync`, `lint`, `inventory` and `rerere train` find the stack by excluding the upstream tag and every superseded
+`main`, so the stack is the same before and after landing, and `patch-policy` passes on the sync PR itself.
 
 ### Downstream releases
 

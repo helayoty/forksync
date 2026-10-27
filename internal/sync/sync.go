@@ -72,11 +72,80 @@ func ResolveRef(ctx context.Context, g gitx.Runner, remote, tag string) string {
 	return tag
 }
 
-// HumanCommits lists commits on branch (beyond base) not authored by the bot.
-// A non-empty result means an owner has worked on the branch and the bot must
-// not regenerate it.
+// BaseOf returns the UPSTREAM_BASE recorded in rev's tree.
+func BaseOf(ctx context.Context, g gitx.Runner, rev string) (string, error) {
+	out, err := g.Git(ctx, "show", rev+":"+BaseFile)
+	if err != nil {
+		return "", fmt.Errorf("read %s at %s: %w", BaseFile, rev, err)
+	}
+	return strings.TrimSpace(out), nil
+}
+
+// EnsureRef resolves tag like ResolveRef, fetching it from remote once if it
+// is not available locally.
+func EnsureRef(ctx context.Context, g gitx.Runner, remote, tag string) (string, error) {
+	ref := ResolveRef(ctx, g, remote, tag)
+	if _, err := g.Git(ctx, "rev-parse", "--verify", "--quiet", ref+"^{commit}"); err == nil {
+		return ref, nil
+	}
+	if _, err := g.Git(ctx, "fetch", "--no-tags", remote, "refs/tags/"+tag+":refs/tags/"+tag); err != nil {
+		return "", fmt.Errorf("upstream base %s is not available locally and could not be fetched from %s: %w", tag, remote, err)
+	}
+	return tag, nil
+}
+
+// Superseded returns the heads that syncs reachable from head (and not from
+// exclude) have replaced, read from their Forksync-Supersedes trailers.
+func Superseded(ctx context.Context, g gitx.Runner, head string, exclude ...string) ([]string, error) {
+	args := []string{"log", "--merges", "--ignore-missing", "--format=%B%x1e", head}
+	if len(exclude) > 0 {
+		args = append(append(args, "--not"), exclude...)
+	}
+	out, err := g.Git(ctx, args...)
+	if err != nil {
+		return nil, err
+	}
+	var heads []string
+	for _, msg := range strings.Split(out, "\x1e") {
+		for _, line := range strings.Split(msg, "\n") {
+			if v, ok := strings.CutPrefix(strings.TrimSpace(line), patch.TrailerSupersedes+":"); ok {
+				if v = strings.TrimSpace(v); v != "" {
+					heads = append(heads, v)
+				}
+			}
+		}
+	}
+	return heads, nil
+}
+
+// StackOf returns the UPSTREAM_BASE recorded at head and the patch stack head
+// carries on top of it, oldest first. Upstream commits, anything reachable
+// from exclude, and every line a landed sync superseded are left out, so the
+// result is the same before and after a sync PR lands as a merge commit.
+func StackOf(ctx context.Context, g gitx.Runner, remote, head string, exclude ...string) (string, []patch.Patch, error) {
+	base, err := BaseOf(ctx, g, head)
+	if err != nil {
+		return "", nil, err
+	}
+	baseRef, err := EnsureRef(ctx, g, remote, base)
+	if err != nil {
+		return base, nil, err
+	}
+	ex := append([]string{baseRef}, exclude...)
+	sup, err := Superseded(ctx, g, head, ex...)
+	if err != nil {
+		return base, nil, err
+	}
+	stack, err := patch.ListExcluding(ctx, g, head, append(ex, sup...)...)
+	return base, stack, err
+}
+
+// HumanCommits lists first-parent commits on branch (beyond base) that the bot
+// did not commit. A non-empty result means an owner has worked on the branch
+// and the bot must not regenerate it. Committers are compared, not authors,
+// because the bot's cherry-picks keep each patch's original author.
 func HumanCommits(ctx context.Context, g gitx.Runner, base, branch string) ([]string, error) {
-	out, err := g.Git(ctx, "log", "--format=%H %an", base+".."+branch)
+	out, err := g.Git(ctx, "log", "--first-parent", "--format=%H %cn", base+".."+branch)
 	if err != nil {
 		return nil, err
 	}
@@ -85,8 +154,8 @@ func HumanCommits(ctx context.Context, g gitx.Runner, base, branch string) ([]st
 		if line == "" {
 			continue
 		}
-		sha, author, _ := strings.Cut(line, " ")
-		if author != BotName {
+		sha, committer, _ := strings.Cut(line, " ")
+		if committer != BotName {
 			human = append(human, sha)
 		}
 	}
@@ -94,22 +163,19 @@ func HumanCommits(ctx context.Context, g gitx.Runner, base, branch string) ([]st
 }
 
 func Run(ctx context.Context, g gitx.Runner, o Options) (*Result, error) {
-	oldBase, err := ReadBase(g.Dir)
+	if _, err := g.Git(ctx, "fetch", "--tags", o.Remote); err != nil {
+		return nil, err
+	}
+	headSHA, err := g.Git(ctx, "rev-parse", "--verify", o.Head+"^{commit}")
+	if err != nil {
+		return nil, err
+	}
+	oldBase, stack, err := StackOf(ctx, g, o.Remote, headSHA)
 	if err != nil {
 		return nil, err
 	}
 	res := &Result{OldBase: oldBase, NewBase: o.Ref}
-
-	if _, err := g.Git(ctx, "fetch", "--tags", o.Remote); err != nil {
-		return nil, err
-	}
-	oldRef := ResolveRef(ctx, g, o.Remote, oldBase)
 	newRef := ResolveRef(ctx, g, o.Remote, o.Ref)
-
-	stack, err := patch.List(ctx, g, oldRef, o.Head)
-	if err != nil {
-		return nil, err
-	}
 
 	for _, kv := range [][2]string{{"rerere.enabled", "true"}, {"rerere.autoupdate", "true"}} {
 		if _, err := g.Git(ctx, "config", kv[0], kv[1]); err != nil {
@@ -126,6 +192,7 @@ func Run(ctx context.Context, g gitx.Runner, o Options) (*Result, error) {
 		return nil, err
 	}
 
+	var pairs [][2]string
 	for _, p := range stack {
 		if p.IsBaseBump {
 			continue // regenerated at the end
@@ -141,6 +208,9 @@ func Run(ctx context.Context, g gitx.Runner, o Options) (*Result, error) {
 		switch outcome {
 		case pickApplied:
 			res.Kept = append(res.Kept, p)
+			if picked, err := g.HeadSHA(ctx); err == nil {
+				pairs = append(pairs, [2]string{p.SHA, picked})
+			}
 		case pickEmpty:
 			res.Dropped = append(res.Dropped, Dropped{p, "absorbed upstream: cherry-pick onto " + o.Ref + " is empty"})
 		case pickConflict:
@@ -154,9 +224,10 @@ done:
 	if err := writeBaseBump(ctx, g, o); err != nil {
 		return res, err
 	}
-
-	res.RangeDiff, _ = g.Git(ctx, "range-diff", "--no-color",
-		oldRef+".."+o.Head, newRef+".."+o.Branch)
+	res.RangeDiff = rangeDiff(ctx, g, pairs)
+	if err := supersede(ctx, g, headSHA, o.Ref); err != nil {
+		return res, err
+	}
 
 	if o.ReportPath != "" {
 		if err := os.WriteFile(o.ReportPath, []byte(Report(res, o)), 0o644); err != nil {
@@ -278,9 +349,32 @@ func writeBaseBump(ctx context.Context, g gitx.Runner, o Options) error {
 	return err
 }
 
+// supersede ends the sync branch with a merge of the old head that keeps the
+// branch's tree. The sync PR then contains its base, so it merges without
+// conflicts, and the trailer tells StackOf that the old head's history is no
+// longer the stack.
+func supersede(ctx context.Context, g gitx.Runner, oldHead, ref string) error {
+	msg := fmt.Sprintf("forksync: supersede %s with the %s stack\n\n%s: %s\n",
+		short(oldHead), ref, patch.TrailerSupersedes, oldHead)
+	_, err := g.Git(ctx, "merge", "-q", "-s", "ours", "--no-ff", "-m", msg, oldHead)
+	return err
+}
+
+// rangeDiff compares each carried patch with its re-applied copy.
+func rangeDiff(ctx context.Context, g gitx.Runner, pairs [][2]string) string {
+	var out []string
+	for _, p := range pairs {
+		if s, err := g.Git(ctx, "range-diff", "--no-color", p[0]+"^!", p[1]+"^!"); err == nil && s != "" {
+			out = append(out, s)
+		}
+	}
+	return strings.Join(out, "\n")
+}
+
 func Report(r *Result, o Options) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "## Upstream sync: `%s` → `%s`\n\n", r.OldBase, r.NewBase)
+	b.WriteString("Land with **Create a merge commit**. Squash or rebase would drop the upstream history this branch brings in.\n\n")
 	fmt.Fprintf(&b, "| | count |\n|---|---|\n| carried forward | %d |\n| dropped | %d |\n| **conflicts** | **%d** |\n\n",
 		len(r.Kept), len(r.Dropped), len(r.Conflicts))
 

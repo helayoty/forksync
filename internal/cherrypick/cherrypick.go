@@ -27,6 +27,7 @@ type prView struct {
 	Number         int    `json:"number"`
 	State          string `json:"state"`
 	ReviewDecision string `json:"reviewDecision"`
+	BaseRefName    string `json:"baseRefName"`
 	MergeCommit    struct {
 		OID string `json:"oid"`
 	} `json:"mergeCommit"`
@@ -59,24 +60,53 @@ func Run(ctx context.Context, g gitx.Runner, o Options) ([]string, error) {
 	}
 
 	var picked []string
-	for _, c := range source.Commits {
-		if _, err := g.Git(ctx, "cherry-pick", "-x", c.OID); err != nil {
+	for _, sha := range commitsToPick(ctx, g, o.Remote, source) {
+		if _, err := g.Git(ctx, "cherry-pick", "-x", sha); err != nil {
 			unmerged, _ := g.Unmerged(ctx)
 			_, _ = g.Git(ctx, "cherry-pick", "--abort")
-			return picked, fmt.Errorf("conflict picking %s (files: %s): %w", c.OID[:12], strings.Join(unmerged, ", "), errors.Unwrap(err))
+			return picked, fmt.Errorf("conflict picking %s (files: %s): %w", sha[:12], strings.Join(unmerged, ", "), errors.Unwrap(err))
 		}
 		if err := relabelHead(ctx, g, o.PR, o.Owner); err != nil {
 			return picked, err
 		}
-		sha, _ := g.HeadSHA(ctx)
-		picked = append(picked, sha)
+		head, _ := g.HeadSHA(ctx)
+		picked = append(picked, head)
 	}
 	return picked, nil
 }
 
+// commitsToPick returns what to cherry-pick for pr. A squash-merged PR is
+// taken as its merge commit: that is the change exactly as upstream has it,
+// and it is reachable from later upstream tags, so a sync drops the pick by
+// ancestry. Picking the PR's own commits instead conflicts whenever a later
+// commit in the PR edits an earlier one's lines, and their shas never become
+// reachable upstream. Unmerged and merge-commit PRs use the PR's commits.
+func commitsToPick(ctx context.Context, g gitx.Runner, remote string, pr *prView) []string {
+	var shas []string
+	for _, c := range pr.Commits {
+		shas = append(shas, c.OID)
+	}
+	merged := pr.MergeCommit.OID
+	if pr.State != "MERGED" || merged == "" || pr.BaseRefName == "" {
+		return shas
+	}
+	if _, err := g.Git(ctx, "fetch", "--no-tags", remote, "refs/heads/"+pr.BaseRefName); err != nil {
+		return shas
+	}
+	out, err := g.Git(ctx, "log", "-1", "--format=%P%x00%s", merged)
+	if err != nil {
+		return shas
+	}
+	parents, subject, _ := strings.Cut(out, "\x00")
+	if len(strings.Fields(parents)) == 1 && strings.HasSuffix(subject, fmt.Sprintf("(#%d)", pr.Number)) {
+		return []string{merged}
+	}
+	return shas
+}
+
 func view(ctx context.Context, g gitx.Runner, repo string, n int) (*prView, error) {
 	out, err := g.GH(ctx, "pr", "view", fmt.Sprint(n), "--repo", repo,
-		"--json", "number,state,reviewDecision,mergeCommit,commits")
+		"--json", "number,state,reviewDecision,baseRefName,mergeCommit,commits")
 	if err != nil {
 		return nil, err
 	}
