@@ -83,6 +83,7 @@ func TestTrainPushPull(t *testing.T) {
 
 	// bot sync → conflict, branch sync/v1.1.0 has only the base bump
 	t.Setenv("GIT_AUTHOR_NAME", fsync.BotName)
+	t.Setenv("GIT_COMMITTER_NAME", fsync.BotName)
 	res, err := fsync.Run(ctx, fork, fsync.Options{Remote: "upstream", Ref: "v1.1.0", Head: "main", Branch: "sync/v1.1.0", BumpOwner: "@bot", ContinueOnConflict: true})
 	if err != fsync.ErrConflicts || len(res.Conflicts) != 1 {
 		t.Fatalf("expected one conflict, got %v %+v", err, res)
@@ -94,6 +95,7 @@ func TestTrainPushPull(t *testing.T) {
 
 	// alice re-applies by hand (no rerere involved)
 	t.Setenv("GIT_AUTHOR_NAME", "alice")
+	t.Setenv("GIT_COMMITTER_NAME", "alice")
 	_, _ = fork.Git(ctx, "cherry-pick", patchSHA)
 	write(t, fork, "f.go", "a\nB-fork\nc\n")
 	run(t, fork, "add", "f.go")
@@ -130,6 +132,7 @@ func TestTrainPushPull(t *testing.T) {
 		t.Fatalf("pull: %v %v", ok, err)
 	}
 	t.Setenv("GIT_AUTHOR_NAME", fsync.BotName)
+	t.Setenv("GIT_COMMITTER_NAME", fsync.BotName)
 	res, err = fsync.Run(ctx, ci, fsync.Options{Remote: "upstream", Ref: "v1.2.0", Head: "main", Branch: "sync/v1.2.0", BumpOwner: "@bot", ContinueOnConflict: true})
 	if err != nil {
 		t.Fatalf("sync after pull: %v conflicts=%+v", err, res.Conflicts)

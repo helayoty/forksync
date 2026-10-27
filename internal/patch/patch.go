@@ -38,6 +38,9 @@ const (
 	TrailerDropWhen = "Drop-when"
 	TrailerUpstream = "Upstream"      // <carry> only: PR URL/number (pending) or "none: <reason>" (permanent)
 	TrailerBaseBump = "Forksync-Base" // marks the generated UPSTREAM_BASE bump commit
+	// TrailerSupersedes is set on the merge that ends a sync branch. Its value is
+	// the head the sync rebuilt; that head's history is no longer the stack.
+	TrailerSupersedes = "Forksync-Supersedes"
 )
 
 var (
@@ -130,7 +133,17 @@ func Parse(sha, message string) Patch {
 
 // List returns the patch stack base..head, oldest first.
 func List(ctx context.Context, g gitx.Runner, base, head string) ([]Patch, error) {
-	out, err := g.Git(ctx, "log", "--reverse", "--no-merges", "--format=%H%x00%B%x1e", base+".."+head)
+	return ListExcluding(ctx, g, head, base)
+}
+
+// ListExcluding returns the non-merge commits reachable from head and from
+// none of exclude, oldest first. Unknown exclude revisions are ignored.
+func ListExcluding(ctx context.Context, g gitx.Runner, head string, exclude ...string) ([]Patch, error) {
+	args := []string{"log", "--reverse", "--topo-order", "--no-merges", "--ignore-missing", "--format=%H%x00%B%x1e", head}
+	if len(exclude) > 0 {
+		args = append(append(args, "--not"), exclude...)
+	}
+	out, err := g.Git(ctx, args...)
 	if err != nil {
 		return nil, err
 	}
